@@ -24,3 +24,26 @@ jq '.[] | select(._source.rule.groups[]? == "credential_access")' wazuh_export.j
 **Answer:** `C:\Program Files\Mozilla Firefox\firefox.exe`
 
 **Analysis:** mimikatz was spawned as a child process of Firefox rather than a shell/RDP session — indicating the tool was downloaded and executed directly through a browser session on the compromised ManageEngine admin host (`SRV-MANAGE01`), consistent with Crimson Fox's initial foothold there.
+
+## Q2 — Persistence mechanism `imagePath` on DB01 (Event ID 7045)
+
+**Technique:** Filter on Wazuh's `persistence` rule group rather than manually scanning for service/scheduled-task events across all hosts.
+
+```bash
+jq '.[] | select(._source.rule.groups[]? == "persistence")' wazuh_export.json
+```
+
+**Result:** One match, host `DB01`, rule *"New Windows service installed"* (level 8), Event ID 7045 (Service Control Manager).
+
+```json
+{
+  "serviceName": "PSEXESVC",
+  "imagePath": "C:\\Windows\\PSEXESVC.exe",
+  "user": "SYSTEM",
+  "message": "A service was installed to start from Windows root path"
+}
+```
+
+**Answer:** `C:\Windows\PSEXESVC.exe` (submit with literal double backslashes: `C:\\Windows\\PSEXESVC.exe`)
+
+**Analysis:** `PSEXESVC` is the service PsExec (Sysinternals) installs on a target host to execute commands remotely. Its presence on `DB01` — a database server with no legitimate reason to run interactive admin tooling — indicates the attacker used PsExec for lateral movement/remote execution here, consistent with the domain-wide GPO/MSI deployment phase of the intrusion.
