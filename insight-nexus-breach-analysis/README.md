@@ -27,18 +27,18 @@ Source material: an HTB SOC-analyst style scenario, investigated using a Wazuh l
 
 ## Methodology
 
-Each finding below is documented with: the event ID / log source used, the filter/query applied, the relevant raw log excerpt, and the reasoning that ties it back to the attacker's timeline.
+`wazuh_export.json` contains 200 Wazuh alert documents. 192 of these are generic "process created" (Event ID 4688) noise spread across all monitored hosts — a deliberate reflection of the "alert fatigue" problem described in the scenario. The other 8 carry custom Wazuh detection rules (tagged with `rule.groups` like `credential_access`, `persistence`, `exfiltration`, `lateral`) that flag the genuinely suspicious behavior. Each finding below was reached by filtering on the relevant rule group with `jq` rather than manually scanning all 200 events. Full methodology, raw evidence, and reasoning for each answer: [`notes.md`](./notes.md).
 
 ## Findings
 
-_In progress — see [`notes.md`](./notes.md) for the working investigation log._
-
 | # | Question | Answer | Evidence |
 |---|---|---|---|
-| 1 | Parent process of credential dumping tool | _TBD_ | _TBD_ |
-| 2 | Persistence `imagePath` on DB01 | _TBD_ | _TBD_ |
-| 3 | Exfil destination IP for `diagnostics_data.zip` | _TBD_ | _TBD_ |
-| 4 | User connecting to `\\fs01\projects` | _TBD_ | _TBD_ |
+| 1 | Parent process of credential dumping tool | `C:\Program Files\Mozilla Firefox\firefox.exe` | mimikatz.exe spawned as a child of Firefox on `SRV-MANAGE01` |
+| 2 | Persistence `imagePath` on DB01 | `C:\Windows\PSEXESVC.exe` | PsExec service installed on `DB01` (Event ID 7045) |
+| 3 | Exfil destination IP for `diagnostics_data.zip` | `93.184.216.34` | HTTPS POST from `updater.exe` on `SRV-MANAGE01` (Event ID 3) |
+| 4 | User connecting to `\\fs01\projects` | `svc_admin` | SMB connection `SCDC01` → `FS01` over port 445 (Event ID 3) |
+
+Screenshots of each confirmed answer and the corresponding terminal output are in [`screenshots/`](./screenshots).
 
 ## MITRE ATT&CK Mapping
 
@@ -46,12 +46,16 @@ _In progress — see [`notes.md`](./notes.md) for the working investigation log.
 |---|---|---|
 | Initial Access | T1078.004 – Valid Accounts (Cloud/Default Creds) | ManageEngine `admin/admin` login |
 | Initial Access | T1190 – Exploit Public-Facing Application | PHP portal file upload |
+| Credential Access | T1003 – OS Credential Dumping | mimikatz.exe executed via Firefox on `SRV-MANAGE01` |
+| Persistence / Lateral Movement | T1569.002 – System Services: Service Execution (PsExec) | `PSEXESVC` service on `DB01` |
 | Persistence | T1547 / T1543 / T1069 | GPO-deployed MSI, scheduled task |
-| Command & Control | T1071.001 – Web Protocols | HTTPS beacon to `103.112.60.117` |
-| Exfiltration | T1560 / T1041 | `diagnostics_data.zip` upload |
+| Discovery / Lateral Movement | T1021.002 – SMB/Windows Admin Shares | `svc_admin` connection to `\\fs01\projects` |
+| Command & Control | T1071.001 – Web Protocols | HTTPS beacon to `cdn.evilcdn.net` / `93.184.216.34` |
+| Exfiltration | T1560 / T1041 | `diagnostics_data.zip` uploaded to `93.184.216.34` |
 
 ## Lessons Learned
 
 - Default credentials on internet-facing admin tools remain a top initial-access vector.
 - Multiple concurrent intrusions can co-exist in one environment — a "loud" low-skill actor can mask a quieter, more capable one.
 - Alert correlation across disparate log sources (web app auth, Sysmon, LDAP, file share access) is what actually surfaces the full picture.
+- Narrative/report details from earlier in an incident (e.g. a C2 IP mentioned in the write-up) should never be assumed to apply to later events without re-verifying against the actual logs — this investigation surfaced two distinct attacker-controlled IPs, not one.
