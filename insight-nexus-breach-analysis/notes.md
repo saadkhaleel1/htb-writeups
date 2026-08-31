@@ -71,3 +71,39 @@ jq '.[] | select(._source.rule.groups[]? == "exfiltration")' wazuh_export.json
 **Answer:** `93.184.216.34`
 
 **Analysis:** This is a distinct IP from the ManageEngine C2 channel mentioned earlier in the incident narrative (`103.112.60.117`) — a reminder to always verify against the actual log evidence rather than assuming details carry over between phases of an incident. This IP ties directly to an earlier "Suspicious DNS request for rare domain" alert, where `cdn.evilcdn.net` resolved to this same `93.184.216.34`. Full kill chain: a PowerShell one-liner downloads and writes `updater.exe` to `svc_deployer`'s AppData\Roaming → that binary beacons to `cdn.evilcdn.net` (93.184.216.34) → it exfiltrates `diagnostics_data.zip` to the same IP over HTTPS/443.
+
+## Q4 — User connecting to `\\fs01\projects` (Event ID 3)
+
+**Technique:** Filter on the `lateral` rule group. Note this returns **two** events (the GPO/MSI deployment on `DEV-021` is also tagged `lateral`) — the relevant one is identified by its `details` field explicitly naming the share.
+
+```bash
+jq '.[] | select(._source.rule.groups[]? == "lateral")' wazuh_export.json
+```
+
+**Result:** Rule *"Possible suspicious access to Windows admin shares"* (level 8, groups: `smb`, `lateral`), Sysmon Event ID 3.
+
+```json
+{
+  "image": "C:\\Windows\\System32\\svchost.exe",
+  "sourceIp": "172.16.200.50",
+  "destinationIp": "172.16.10.20",
+  "destinationPort": "445",
+  "user": "svc_admin",
+  "details": "SMB connect to \\\\fs01\\projects"
+}
+```
+
+**Answer:** `svc_admin`
+
+**Analysis:** `sourceIp` (172.16.200.50) maps to `SCDC01`, `destinationIp` (172.16.10.20) maps to `FS01`. The `svc_admin` service account — likely intended for legitimate administrative automation — was used to reach the file server's `projects` share over SMB/445. Combined with the earlier PsExec persistence on `DB01`, this shows the attacker pivoting through multiple internal hosts using compromised service accounts rather than a single foothold, consistent with Crimson Fox's "map users and machines" reconnaissance phase before targeting file shares containing client project data.
+
+---
+
+## Summary — All Answers
+
+| # | Question | Answer |
+|---|---|---|
+| 1 | Parent process of credential dumping tool | `C:\Program Files\Mozilla Firefox\firefox.exe` |
+| 2 | Persistence `imagePath` on DB01 | `C:\Windows\PSEXESVC.exe` |
+| 3 | Exfil destination IP for `diagnostics_data.zip` | `93.184.216.34` |
+| 4 | User connecting to `\\fs01\projects` | `svc_admin` |
